@@ -1,12 +1,34 @@
+import os
 import torch
+import pathlib
 import numpy as np
+import subprocess as sp
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from transformers import AutoTokenizer, AutoModel
 
-MAXLEN = 512
+from colbert.modeling.colbert import ColBERT
+from colbert.infra.config import ColBERTConfig
+from colbert.modeling.tokenization.query_tokenization import QueryTokenizer
+from colbert.modeling.tokenization.doc_tokenization import DocTokenizer
+from colbert.utils.utils import load_checkpoint
+
+MAXLEN = 300
+
+#PATH = os.environ['HOME'] + '/.cloudnote/'
+PATH = "/home/joey/.eidetic/"
+
+CHECKPOINT = PATH + "colbertv2.0/"
+
+# download weights if they're not here and we're not in AWS
+if str(pathlib.Path().resolve())[:5] != '/var/' and not os.path.isdir(CHECKPOINT):
+    print("Collecting ColBERT weights to", CHECKPOINT)
+
+    sp.run(f"mkdir -p {PATH}".split(' '))
+    sp.run(f"wget -O {PATH}colbert_weights.tar.gz https://downloads.cs.stanford.edu/nlp/data/colbert/colbertv2/colbertv2.0.tar.gz".split(' '))
+    sp.run(f"tar -xvzf {PATH}colbert_weights.tar.gz -C {PATH}".split(' '))
 
 def normalize(v):
     """
@@ -32,45 +54,51 @@ def split_pad(tensor):
 class LanguageModel:
     def __init__(self):
         self.initialized = False
-    
-    def initialize_models(self):
-        self.tokenizer = AutoTokenizer.from_pretrained('princeton-nlp/sup-simcse-roberta-base')
-        self.model = AutoModel.from_pretrained("princeton-nlp/sup-simcse-roberta-base")
-        self.model.eval()
+
+        config = ColBERTConfig.load_from_checkpoint(CHECKPOINT)
+        config.query_maxlen = MAXLEN
+        config.doc_maxlen = MAXLEN
+        config.nway = 1
+        config.interaction = "colbert"
+
+        self.query_tokenizer = QueryTokenizer(config)
+        self.entry_tokenizer = DocTokenizer(config)
+
+        self.model = ColBERT(CHECKPOINT, colbert_config=config)
+
+    def detach(self, tensor):
+        return torch.squeeze(tensor, dim=0).detach().numpy()
     
     def forward(self, input_text):
-        inputs = self.tokenizer.encode_plus(input_text, return_tensors="pt")
+        tensors = self.entry_tokenizer.tensorize([input_text])
+        embedding, mask = self.model.doc(*tensors, keep_dims='return_mask')
 
-        split = inputs['input_ids'].size()[-1] > MAXLEN
-        if split:
-            inputs['input_ids'] = split_pad(inputs['input_ids'])
-            inputs['attention_mask'] = split_pad(inputs['attention_mask'])
+        embedding = normalize(self.detach(embedding))
+        mask = self.detach(mask)
 
-        outputs = self.model(**inputs)
-
-        embed = outputs.pooler_output
-        if split:
-            embed = torch.mean(embed, 0, keepdim=True)
-
-        embed = torch.squeeze(embed).detach().numpy()
-        embed = normalize(embed)
-
-        return embed
+        return embedding, mask
 
 lm = LanguageModel()
-lm.initialize_models()
 
 app = Flask(__name__)
 cors = CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+
+@app.route("/ping", methods=['GET'])
+def ping():
+    return jsonify({ 'message': 'alive' })
 
 @app.route("/get-embedding", methods=['POST'])
 def get_embedding():
     if request.method == 'POST':
         data = request.json
 
-        embedding = lm.forward(data['text'])
-        embedding = [str(round(i, 4)) for i in embedding]
+        embedding, mask = lm.forward(data['text'])
+        print(embedding.shape)
 
-        return jsonify({ 'message': 'success', 'embedding': embedding })
+        embedding = [[str(round(i, 5)) for i in v] for v in embedding]
+        mask = [str(i[0]) for i in mask]
+
+        return jsonify({ 'message': 'success', 'mask': mask, 'embedding': embedding })
     else:
         return jsonify({ 'message': "didn't work" })
